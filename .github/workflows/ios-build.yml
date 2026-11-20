@@ -1,0 +1,662 @@
+name: iOS Build
+run-name: iOS Build ${{ inputs.build_id || 'rodeway-ios' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_id:
+        description: 'Unique build identifier'
+        required: false
+        type: string
+        default: 'rodeway-ios'
+      snapshot_ref:
+        description: 'Ref holding the working-tree snapshot to build (empty builds this branch)'
+        required: false
+        type: string
+        default: ''
+      ios_path:
+        description: 'Path to iOS project (e.g., "ios" for React Native)'
+        required: false
+        type: string
+        default: 'ios'
+      scheme:
+        description: 'Xcode scheme to build (auto-detected if empty)'
+        required: false
+        type: string
+        default: 'Runner'
+      use_signing:
+        description: 'Enable code signing (requires secrets to be configured)'
+        required: false
+        type: boolean
+        default: false
+      configuration:
+        description: 'Build configuration (Debug is faster, Release for production)'
+        required: false
+        type: string
+        default: 'Release'
+      flutter_version:
+        description: 'Flutter version to use (e.g., 3.24.0). Empty means latest stable.'
+        required: false
+        type: string
+        default: ''
+      jdk_version:
+        description: 'JDK version for Kotlin Multiplatform Gradle builds (e.g., 17).'
+        required: false
+        type: string
+        default: '17'
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          lfs: true
+
+      # The dispatch always runs the workflow from the default branch, so the
+      # sources come from a snapshot ref pushed by the CLI instead.
+      - name: Checkout working-tree snapshot
+        if: inputs.snapshot_ref != ''
+        env:
+          SNAPSHOT_REF: ${{ inputs.snapshot_ref }}
+        run: |
+          set -e
+          git fetch --depth=1 origin "+$SNAPSHOT_REF:refs/heads/snapshot"
+          git checkout --force snapshot
+          git lfs pull
+          echo "Building $(git rev-parse --short HEAD)"
+
+      - name: Setup Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Restore DerivedData cache
+        uses: actions/cache/restore@v6
+        id: cache-deriveddata
+        with:
+          path: DerivedData
+          key: deriveddata-${{ github.run_id }}
+          restore-keys: |
+            deriveddata-
+
+      - name: Detect project type
+        id: detect
+        run: |
+          if [ -f "pubspec.yaml" ]; then
+            echo "type=flutter" >> $GITHUB_OUTPUT
+          elif [ -f "package.json" ] && grep -q '"expo"' package.json; then
+            echo "type=expo" >> $GITHUB_OUTPUT
+          elif [ -f "package.json" ] && grep -q '"react-native"' package.json; then
+            echo "type=reactnative" >> $GITHUB_OUTPUT
+          elif grep -rqlE 'kotlin\("multiplatform"\)|org\.jetbrains\.kotlin\.multiplatform|id\("org.jetbrains.kotlin.multiplatform"\)' --include='*.gradle.kts' --include='*.gradle' --include='libs.versions.toml' . 2>/dev/null; then
+            echo "type=kmp" >> $GITHUB_OUTPUT
+          else
+            echo "type=native" >> $GITHUB_OUTPUT
+          fi
+
+      # A gitignored *.xcconfig next to a committed template is a common iOS
+      # convention. The snapshot then carries the template but not the config,
+      # and xcodebuild fails with "Unable to open base configuration reference
+      # file", which says nothing about which file is missing.
+      - name: Materialize missing xcconfig files
+        run: |
+          set -e
+          find . -path ./DerivedData -prune -o -type f \
+            \( -name '*.xcconfig.template' -o -name '*.xcconfig.example' \
+               -o -name '*.xcconfig.sample' -o -name '*.template.xcconfig' \
+               -o -name '*.example.xcconfig' -o -name '*.sample.xcconfig' \) -print \
+          | while IFS= read -r template; do
+              case "$template" in
+                *.xcconfig.template|*.xcconfig.example|*.xcconfig.sample) target="${template%.*}" ;;
+                *) target="$(dirname "$template")/$(basename "$template" | sed -E 's/\.(template|example|sample)\.xcconfig$/.xcconfig/')" ;;
+              esac
+              if [ ! -f "$target" ]; then
+                cp "$template" "$target"
+                echo "::warning::$target was missing (gitignored?); copied $template over it. Any placeholder values in it are what the build sees."
+              fi
+            done
+
+      - name: Materialize missing environment file
+        env:
+          ENV_FILE_SECRET: ${{ secrets.ENV_FILE || secrets.DOTENV || '' }}
+        run: |
+          set -e
+          if [ ! -f ".env" ]; then
+            if [ -n "$ENV_FILE_SECRET" ]; then
+              echo "$ENV_FILE_SECRET" > .env
+              echo "Materialized .env from GitHub secrets."
+            elif [ -f ".env.example" ]; then
+              cp .env.example .env
+              echo "::warning::.env was missing (gitignored); copied .env.example over it for asset bundling."
+            else
+              touch .env
+              echo "::warning::Created empty .env file for asset bundling."
+            fi
+          fi
+
+      - name: Generate Xcode project (XcodeGen)
+        env:
+          IOS_PATH: ${{ inputs.ios_path }}
+        run: |
+          set -e
+          cd "$IOS_PATH"
+
+          # Projects generated by XcodeGen usually keep the .xcodeproj out of git,
+          # so the checkout has a project.yml manifest but nothing to build.
+          MANIFEST=""
+          for f in project.yml project.yaml; do
+            if [ -f "$f" ] && grep -qE '^targets:' "$f"; then
+              MANIFEST="$f"
+              break
+            fi
+          done
+
+          if [ -z "$MANIFEST" ]; then
+            echo "No XcodeGen manifest — skipping."
+          elif [ -n "$(find . -maxdepth 1 -name '*.xcodeproj' -print -quit)" ]; then
+            echo "Found a committed .xcodeproj — skipping generation."
+          else
+            echo "Found $MANIFEST and no .xcodeproj — generating with XcodeGen."
+            brew install xcodegen
+            xcodegen generate
+          fi
+
+      # Whatever the previous step could not fill in is named here, instead of
+      # surfacing as xcodebuild's "Unable to open base configuration reference".
+      - name: Check base configuration files
+        env:
+          IOS_PATH: ${{ inputs.ios_path }}
+        run: |
+          set -e
+          MISSING=""
+          for pbx in $(find "$IOS_PATH" -maxdepth 2 -name project.pbxproj -not -path '*/Pods.xcodeproj/*'); do
+            for id in $(grep -o 'baseConfigurationReference = [A-Za-z0-9]*' "$pbx" | awk '{print $3}' | sort -u); do
+              ref=$(grep -m1 "^[[:space:]]*$id .*isa = PBXFileReference" "$pbx" || true)
+              name=$(printf '%s' "$ref" | sed -n 's/.*[ \t]path = "\{0,1\}\([^";]*\)"\{0,1\};.*/\1/p')
+              [ -n "$name" ] || continue
+              base=$(basename "$name")
+              # CocoaPods writes its xcconfigs during pod install and Flutter
+              # writes Generated.xcconfig during pub get — both happen later in
+              # this job, so they are legitimately absent right now.
+              case "$name" in *Pods/*|*"Target Support Files"*) continue ;; esac
+              case "$base" in Pods-*|Generated.xcconfig) continue ;; esac
+              if [ -z "$(find . -name "$base" -print -quit)" ]; then
+                MISSING="$MISSING $base"
+              fi
+            done
+          done
+          if [ -n "$MISSING" ]; then
+            echo "::error::The project has base configuration files that are not in the repository:$MISSING. They are probably gitignored — commit them, or commit a <name>.xcconfig.template next to each so the build can fill them in."
+            exit 1
+          fi
+
+      - name: Setup Flutter
+        if: steps.detect.outputs.type == 'flutter'
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ inputs.flutter_version || '' }}
+          channel: ${{ inputs.flutter_version && 'stable' || 'stable' }}
+          cache: true
+
+      - name: Flutter pub get
+        if: steps.detect.outputs.type == 'flutter'
+        run: flutter pub get
+
+      - name: Setup Node.js
+        if: steps.detect.outputs.type == 'reactnative' || steps.detect.outputs.type == 'expo'
+        uses: actions/setup-node@v7
+        with:
+          node-version: '20'
+
+      - name: Restore node_modules cache
+        if: steps.detect.outputs.type == 'reactnative' || steps.detect.outputs.type == 'expo'
+        uses: actions/cache@v6
+        id: node-modules-cache
+        with:
+          path: node_modules
+          key: node-modules-${{ runner.os }}-${{ hashFiles('package-lock.json', 'yarn.lock') }}
+          restore-keys: |
+            node-modules-${{ runner.os }}-
+
+      - name: Install npm dependencies
+        if: (steps.detect.outputs.type == 'reactnative' || steps.detect.outputs.type == 'expo') && steps.node-modules-cache.outputs.cache-hit != 'true'
+        run: npm install
+
+      - name: Setup JDK
+        if: steps.detect.outputs.type == 'kmp'
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.jdk_version || '17' }}
+
+      - name: Setup Gradle
+        if: steps.detect.outputs.type == 'kmp'
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Restore Pods cache
+        uses: actions/cache@v6
+        id: pods-cache
+        with:
+          path: |
+            ${{ inputs.ios_path }}/Pods
+            ~/.cocoapods/repos
+          key: pods-${{ runner.os }}-${{ hashFiles(format('{0}/Podfile.lock', inputs.ios_path)) }}
+          restore-keys: |
+            pods-${{ runner.os }}-
+
+      - name: Install certificate and provisioning profile
+        if: inputs.use_signing
+        env:
+          IOS_CERTIFICATE: ${{ secrets.IOS_CERTIFICATE }}
+          IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+          IOS_PROVISIONING_PROFILE: ${{ secrets.IOS_PROVISIONING_PROFILE }}
+        run: |
+          set -e
+
+          # Create temporary keychain
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          KEYCHAIN_PASSWORD=$(openssl rand -base64 32)
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          # Import certificate
+          CERTIFICATE_PATH=$RUNNER_TEMP/certificate.p12
+          echo "$IOS_CERTIFICATE" | base64 --decode > "$CERTIFICATE_PATH"
+          security import "$CERTIFICATE_PATH" -P "$IOS_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+
+          # Install provisioning profile
+          PROFILE_PATH=$RUNNER_TEMP/profile.mobileprovision
+          echo "$IOS_PROVISIONING_PROFILE" | base64 --decode > "$PROFILE_PATH"
+
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          PROFILE_PLIST=$RUNNER_TEMP/profile.plist
+          security cms -D -i "$PROFILE_PATH" > "$PROFILE_PLIST"
+          PROFILE_UUID=$(plutil -extract UUID raw -o - "$PROFILE_PLIST")
+          cp "$PROFILE_PATH" ~/Library/MobileDevice/Provisioning\ Profiles/"$PROFILE_UUID".mobileprovision
+
+          # xcodebuild will not pick a team on its own on a CI machine, so read
+          # the team and profile name out of the profile and pass them to the
+          # build as manual signing settings.
+          TEAM_ID=$(plutil -extract TeamIdentifier.0 raw -o - "$PROFILE_PLIST")
+          PROFILE_NAME=$(plutil -extract Name raw -o - "$PROFILE_PLIST")
+          APP_ID=$(plutil -extract Entitlements.application-identifier raw -o - "$PROFILE_PLIST")
+          PROFILE_BUNDLE_ID=${APP_ID#"$TEAM_ID".}
+
+          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> $GITHUB_ENV
+          echo "DEVELOPMENT_TEAM=$TEAM_ID" >> $GITHUB_ENV
+          echo "PROVISIONING_PROFILE_NAME=$PROFILE_NAME" >> $GITHUB_ENV
+          echo "Certificate and provisioning profile installed"
+          echo "  team:    $TEAM_ID"
+          echo "  profile: $PROFILE_NAME ($PROFILE_UUID)"
+          echo "  app id:  $PROFILE_BUNDLE_ID"
+          echo "If the build fails on a provisioning mismatch, the app's PRODUCT_BUNDLE_IDENTIFIER must match the app id above."
+
+      - name: Prepare UnityFramework if needed
+        run: |
+          if [ -d "ios/UnityLibrary/Unity-iPhone.xcodeproj" ]; then
+            echo "Listing schemes and targets in Unity-iPhone.xcodeproj:"
+            xcodebuild -project ios/UnityLibrary/Unity-iPhone.xcodeproj -list || true
+
+            echo "Ensuring execution permissions for tools..."
+            chmod -R +x ios/UnityLibrary/Il2CppOutputProject/IL2CPP 2>/dev/null || true
+            chmod +x ios/UnityLibrary/process_symbols.sh 2>/dev/null || true
+
+            echo "Building real UnityFramework from exported Unity-iPhone.xcodeproj..."
+            xcodebuild -project ios/UnityLibrary/Unity-iPhone.xcodeproj \
+              -scheme UnityFramework \
+              -configuration Release \
+              -sdk iphoneos \
+              -destination 'generic/platform=iOS' \
+              BUILD_DIR="${GITHUB_WORKSPACE}/ios/UnityLibrary/build" \
+              ARCHS="arm64" \
+              ONLY_ACTIVE_ARCH=NO \
+              ENABLE_BITCODE=NO \
+              CODE_SIGNING_ALLOWED=NO \
+              CODE_SIGNING_REQUIRED=NO \
+              CODE_SIGN_IDENTITY="" \
+              build
+            
+            BUILT_FRAMEWORK=$(find "${GITHUB_WORKSPACE}/ios/UnityLibrary/build" -name "UnityFramework.framework" -type d | head -n 1)
+            if [ -n "$BUILT_FRAMEWORK" ]; then
+              echo "Found built framework at $BUILT_FRAMEWORK. Copying to ios/UnityLibrary..."
+              mkdir -p ios/UnityLibrary/UnityFramework.framework
+              cp -R "$BUILT_FRAMEWORK/"* ios/UnityLibrary/UnityFramework.framework/
+            else
+              echo "::error::UnityFramework.framework was not found in build directory!"
+              find "${GITHUB_WORKSPACE}/ios/UnityLibrary/build" -maxdepth 3 || true
+              exit 1
+            fi
+            if [ -f "ios/UnityLibrary/Libraries/FlutterUnityIntegration/Plugins/iOS/NativeCallProxy.h" ]; then
+              mkdir -p ios/UnityLibrary/UnityFramework.framework/Headers
+              cp "ios/UnityLibrary/Libraries/FlutterUnityIntegration/Plugins/iOS/NativeCallProxy.h" ios/UnityLibrary/UnityFramework.framework/Headers/
+            fi
+            codesign --force --sign - --timestamp=none ios/UnityLibrary/UnityFramework.framework || true
+          elif [ -f "ios/UnityLibrary/UnityFrameworkStub.m" ]; then
+            echo "Compiling UnityFramework stub library..."
+            mkdir -p ios/UnityLibrary/UnityFramework.framework
+            xcrun clang -target arm64-apple-ios15.0 -dynamiclib -framework Foundation -framework UIKit -framework CoreGraphics -framework AVFoundation -isysroot $(xcrun --sdk iphoneos --show-sdk-path) -install_name @rpath/UnityFramework.framework/UnityFramework -Iios/UnityLibrary ios/UnityLibrary/UnityFrameworkStub.m -o ios/UnityLibrary/UnityFramework.framework/UnityFramework
+            codesign --force --sign - --timestamp=none ios/UnityLibrary/UnityFramework.framework || true
+          fi
+
+      - name: Build IPA
+        env:
+          BUILD_ID: ${{ inputs.build_id || 'rodeway-ios' }}
+          IOS_PATH: ${{ inputs.ios_path || 'ios' }}
+          SCHEME: ${{ inputs.scheme || 'Runner' }}
+          PROJECT_TYPE: ${{ steps.detect.outputs.type }}
+          USE_SIGNING: ${{ inputs.use_signing }}
+          CONFIGURATION: ${{ inputs.configuration || 'Release' }}
+        run: |
+          set -e
+
+          # Use custom DerivedData path for caching
+          DERIVED_DATA_PATH="${GITHUB_WORKSPACE}/DerivedData"
+
+          if [ "$PROJECT_TYPE" = "flutter" ]; then
+            cd "$GITHUB_WORKSPACE"
+            echo "Running flutter build ios..."
+            if [ "$CONFIGURATION" = "Debug" ]; then
+              flutter build ios --debug --no-codesign -v
+            else
+              flutter build ios --release --no-codesign -v
+            fi
+
+            # Embed UnityFramework into built Runner.app bundles
+            if [ -d "$GITHUB_WORKSPACE/ios/UnityLibrary/UnityFramework.framework" ]; then
+              echo "Embedding UnityFramework into Runner.app bundles..."
+              find "${GITHUB_WORKSPACE}/build" -name "Runner.app" -type d | while read -r app; do
+                mkdir -p "$app/Frameworks"
+                echo "Copying UnityFramework.framework to $app/Frameworks/"
+                cp -R "$GITHUB_WORKSPACE/ios/UnityLibrary/UnityFramework.framework" "$app/Frameworks/"
+                codesign --force --sign - --timestamp=none "$app/Frameworks/UnityFramework.framework" || true
+
+                if [ -d "$GITHUB_WORKSPACE/ios/UnityLibrary/Data" ] && [ ! -d "$app/Data" ]; then
+                  echo "Copying Data to $app/Data/"
+                  cp -R "$GITHUB_WORKSPACE/ios/UnityLibrary/Data" "$app/Data"
+                fi
+              done
+            fi
+
+            cd "$IOS_PATH"
+
+            if [ "$USE_SIGNING" = "true" ]; then
+              # 'flutter build ios' never signs, so archive the Runner project it
+              # generated. The IPA step below exports build/App.xcarchive
+              # whenever signing is on.
+              ARCHIVE_CMD="xcodebuild"
+              if [ -n "$WORKSPACE" ]; then
+                ARCHIVE_CMD="$ARCHIVE_CMD -workspace '$WORKSPACE'"
+              elif [ -n "$PROJECT" ]; then
+                ARCHIVE_CMD="$ARCHIVE_CMD -project '$PROJECT'"
+              else
+                echo "::error::Signing requested but no Runner workspace/project found in '$IOS_PATH'."
+                exit 1
+              fi
+
+              ARCHIVE_CMD="$ARCHIVE_CMD -scheme '${SCHEME:-Runner}'"
+              ARCHIVE_CMD="$ARCHIVE_CMD -configuration '$CONFIGURATION'"
+              ARCHIVE_CMD="$ARCHIVE_CMD -destination 'generic/platform=iOS'"
+              ARCHIVE_CMD="$ARCHIVE_CMD -derivedDataPath '$DERIVED_DATA_PATH'"
+              ARCHIVE_CMD="$ARCHIVE_CMD COMPILER_INDEX_STORE_ENABLE=NO"
+              ARCHIVE_CMD="$ARCHIVE_CMD DEVELOPMENT_TEAM='$DEVELOPMENT_TEAM'"
+              ARCHIVE_CMD="$ARCHIVE_CMD CODE_SIGN_STYLE=Manual"
+              ARCHIVE_CMD="$ARCHIVE_CMD PROVISIONING_PROFILE_SPECIFIER='$PROVISIONING_PROFILE_NAME'"
+              ARCHIVE_CMD="$ARCHIVE_CMD -quiet"
+              ARCHIVE_CMD="$ARCHIVE_CMD -archivePath '$GITHUB_WORKSPACE/build/App.xcarchive' archive"
+
+              echo "Running: $ARCHIVE_CMD"
+              eval $ARCHIVE_CMD
+
+              # Ensure UnityFramework is embedded into xcarchive
+              if [ -d "$GITHUB_WORKSPACE/ios/UnityLibrary/UnityFramework.framework" ]; then
+                ARCHIVE_APP=$(find "$GITHUB_WORKSPACE/build/App.xcarchive/Products/Applications" -name "*.app" -type d | head -1)
+                if [ -n "$ARCHIVE_APP" ]; then
+                  echo "Embedding UnityFramework into xcarchive: $ARCHIVE_APP/Frameworks"
+                  mkdir -p "$ARCHIVE_APP/Frameworks"
+                  cp -R "$GITHUB_WORKSPACE/ios/UnityLibrary/UnityFramework.framework" "$ARCHIVE_APP/Frameworks/"
+                  codesign --force --sign - --timestamp=none "$ARCHIVE_APP/Frameworks/UnityFramework.framework" || true
+                fi
+              fi
+            fi
+          elif [ "$PROJECT_TYPE" = "reactnative" ] || [ "$PROJECT_TYPE" = "expo" ] || [ "$PROJECT_TYPE" = "kmp" ]; then
+            # Use xcodebuild directly for React Native/Expo and Kotlin Multiplatform.
+            # For KMP, the Xcode build phase (or CocoaPods) invokes Gradle to
+            # compile the shared Kotlin framework, so the JDK must be on PATH.
+            if [ "$PROJECT_TYPE" = "kmp" ]; then
+              echo "Building Kotlin Multiplatform iOS ($CONFIGURATION)..."
+              if [ -f "${GITHUB_WORKSPACE}/gradlew" ]; then
+                chmod +x "${GITHUB_WORKSPACE}/gradlew"
+              fi
+            else
+              echo "Building React Native iOS ($CONFIGURATION)..."
+            fi
+            BUILD_CMD="xcodebuild"
+            if [ -n "$WORKSPACE" ]; then
+              BUILD_CMD="$BUILD_CMD -workspace $WORKSPACE"
+            elif [ -n "$PROJECT" ]; then
+              BUILD_CMD="$BUILD_CMD -project $PROJECT"
+            fi
+
+            # Auto-detect scheme from workspace/project name (e.g., MyApp.xcworkspace -> MyApp)
+            # unless an explicit scheme was provided.
+            if [ -z "$SCHEME" ]; then
+              if [ -n "$WORKSPACE" ]; then
+                SCHEME=$(basename "$WORKSPACE" .xcworkspace)
+              elif [ -n "$PROJECT" ]; then
+                SCHEME=$(basename "$PROJECT" .xcodeproj)
+              fi
+            fi
+
+            BUILD_CMD="$BUILD_CMD -scheme '$SCHEME'"
+            BUILD_CMD="$BUILD_CMD -configuration '$CONFIGURATION'"
+            BUILD_CMD="$BUILD_CMD -destination 'generic/platform=iOS'"
+            BUILD_CMD="$BUILD_CMD -derivedDataPath '$DERIVED_DATA_PATH'"
+            BUILD_CMD="$BUILD_CMD COMPILER_INDEX_STORE_ENABLE=NO"
+            BUILD_CMD="$BUILD_CMD -quiet"
+
+            if [ "$USE_SIGNING" = "true" ]; then
+              # Must archive, not build: the IPA step below exports
+              # build/App.xcarchive whenever signing is on.
+              BUILD_CMD="$BUILD_CMD DEVELOPMENT_TEAM='$DEVELOPMENT_TEAM'"
+              BUILD_CMD="$BUILD_CMD CODE_SIGN_STYLE=Manual"
+              BUILD_CMD="$BUILD_CMD PROVISIONING_PROFILE_SPECIFIER='$PROVISIONING_PROFILE_NAME'"
+              BUILD_CMD="$BUILD_CMD -archivePath '$GITHUB_WORKSPACE/build/App.xcarchive' archive"
+            else
+              BUILD_CMD="$BUILD_CMD CODE_SIGNING_ALLOWED=NO build"
+            fi
+
+            echo "Running: $BUILD_CMD"
+            eval $BUILD_CMD
+          else
+            BUILD_CMD="xcodebuild"
+            if [ -n "$WORKSPACE" ]; then
+              BUILD_CMD="$BUILD_CMD -workspace $WORKSPACE"
+            elif [ -n "$PROJECT" ]; then
+              BUILD_CMD="$BUILD_CMD -project $PROJECT"
+            fi
+
+            BUILD_CMD="$BUILD_CMD -scheme '$SCHEME'"
+            BUILD_CMD="$BUILD_CMD -configuration '$CONFIGURATION'"
+            BUILD_CMD="$BUILD_CMD -destination 'generic/platform=iOS'"
+            BUILD_CMD="$BUILD_CMD -derivedDataPath '$DERIVED_DATA_PATH'"
+
+            # Speed optimization flags
+            BUILD_CMD="$BUILD_CMD COMPILER_INDEX_STORE_ENABLE=NO"
+            BUILD_CMD="$BUILD_CMD DEBUG_INFORMATION_FORMAT=dwarf"
+            BUILD_CMD="$BUILD_CMD ONLY_ACTIVE_ARCH=YES"
+            BUILD_CMD="$BUILD_CMD -quiet"
+
+            # Xcode 16+ native compilation caching
+            BUILD_CMD="$BUILD_CMD SWIFT_ENABLE_COMPILE_CACHE=YES"
+            BUILD_CMD="$BUILD_CMD CLANG_ENABLE_COMPILE_CACHE=YES"
+
+            if [ "$USE_SIGNING" = "true" ]; then
+              # For signed builds, use archive. Automatic signing cannot resolve a
+              # team on a runner (no Xcode account), so sign manually against the
+              # profile installed above.
+              BUILD_CMD="$BUILD_CMD DEVELOPMENT_TEAM='$DEVELOPMENT_TEAM'"
+              BUILD_CMD="$BUILD_CMD CODE_SIGN_STYLE=Manual"
+              BUILD_CMD="$BUILD_CMD PROVISIONING_PROFILE_SPECIFIER='$PROVISIONING_PROFILE_NAME'"
+              BUILD_CMD="$BUILD_CMD -archivePath '$GITHUB_WORKSPACE/build/App.xcarchive' archive"
+            else
+              # For unsigned builds, use faster 'build' action
+              BUILD_CMD="$BUILD_CMD CODE_SIGNING_ALLOWED=NO build"
+            fi
+
+            echo "Running: $BUILD_CMD"
+            eval $BUILD_CMD
+          fi
+
+          # Create IPA
+          if [ "$USE_SIGNING" = "true" ]; then
+            # For signed builds, use xcodebuild -exportArchive.
+            # Everything below is relative to the repo root, which is also what
+            # the upload-artifact step ("build/*.ipa") resolves against — do not
+            # use "cd .." here, it breaks when ios_path is "." (native at root).
+            cd "$GITHUB_WORKSPACE"
+
+            # The export has to use the same manual signing as the archive, and
+            # it needs the app's real bundle id to map it to the profile.
+            APP_BUNDLE_ID=$(plutil -extract ApplicationProperties.CFBundleIdentifier raw -o - build/App.xcarchive/Info.plist)
+            echo "Exporting $APP_BUNDLE_ID with profile '$PROVISIONING_PROFILE_NAME' (team $DEVELOPMENT_TEAM)"
+
+            printf '%s\n' \
+              '<?xml version="1.0" encoding="UTF-8"?>' \
+              '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+              '<plist version="1.0">' \
+              '<dict>' \
+              '    <key>method</key>' \
+              '    <string>development</string>' \
+              '    <key>signingStyle</key>' \
+              '    <string>manual</string>' \
+              '    <key>teamID</key>' \
+              "    <string>${DEVELOPMENT_TEAM}</string>" \
+              '    <key>provisioningProfiles</key>' \
+              '    <dict>' \
+              "        <key>${APP_BUNDLE_ID}</key>" \
+              "        <string>${PROVISIONING_PROFILE_NAME}</string>" \
+              '    </dict>' \
+              '</dict>' \
+              '</plist>' > ExportOptions.plist
+            xcodebuild -exportArchive \
+              -archivePath build/App.xcarchive \
+              -exportOptionsPlist ExportOptions.plist \
+              -exportPath build/export
+
+            # Move IPA to expected location
+            mv build/export/*.ipa "build/$BUILD_ID.ipa"
+            echo "Created signed IPA: build/$BUILD_ID.ipa"
+          else
+            # For unsigned builds, find .app and create IPA
+            APP_PATH=$(find "${GITHUB_WORKSPACE}/build" -name "Runner.app" -type d | head -1)
+            if [ -z "$APP_PATH" ]; then
+              APP_PATH=$(find "${GITHUB_WORKSPACE}/build" -name "*.app" -type d | head -1)
+            fi
+            if [ -z "$APP_PATH" ]; then
+              APP_PATH=$(find "${DERIVED_DATA_PATH}" -name "*.app" -type d | head -1)
+            fi
+
+            if [ -z "$APP_PATH" ]; then
+              echo "Error: Could not find .app"
+              find "${GITHUB_WORKSPACE}" -name "*.app" || true
+              exit 1
+            fi
+            echo "Found app at: $APP_PATH"
+
+            # Ensure UnityFramework is in the app bundle
+            if [ -d "${GITHUB_WORKSPACE}/ios/UnityLibrary/UnityFramework.framework" ]; then
+              echo "Ensuring UnityFramework is in $APP_PATH/Frameworks..."
+              mkdir -p "$APP_PATH/Frameworks"
+              cp -R "${GITHUB_WORKSPACE}/ios/UnityLibrary/UnityFramework.framework" "$APP_PATH/Frameworks/"
+              codesign --force --sign - --timestamp=none "$APP_PATH/Frameworks/UnityFramework.framework" || true
+
+              if [ -d "$GITHUB_WORKSPACE/ios/UnityLibrary/Data" ] && [ ! -d "$APP_PATH/Data" ]; then
+                cp -R "$GITHUB_WORKSPACE/ios/UnityLibrary/Data" "$APP_PATH/Data"
+              fi
+            fi
+
+            cd "$GITHUB_WORKSPACE"
+            mkdir -p build/Payload
+            cp -R "$APP_PATH" build/Payload/
+
+            PAYLOAD_APP=$(find "${GITHUB_WORKSPACE}/build/Payload" -name "*.app" -type d | head -1)
+            if [ -n "$PAYLOAD_APP" ] && [ -d "${GITHUB_WORKSPACE}/ios/UnityLibrary/UnityFramework.framework" ]; then
+              echo "Ensuring UnityFramework is in $PAYLOAD_APP/Frameworks..."
+              mkdir -p "$PAYLOAD_APP/Frameworks"
+              cp -R "${GITHUB_WORKSPACE}/ios/UnityLibrary/UnityFramework.framework" "$PAYLOAD_APP/Frameworks/"
+              codesign --force --sign - --timestamp=none "$PAYLOAD_APP/Frameworks/UnityFramework.framework" || true
+              if [ -d "$GITHUB_WORKSPACE/ios/UnityLibrary/Data" ] && [ ! -d "$PAYLOAD_APP/Data" ]; then
+                cp -R "$GITHUB_WORKSPACE/ios/UnityLibrary/Data" "$PAYLOAD_APP/Data"
+              fi
+            fi
+
+            cd build
+            zip -rq "$BUILD_ID.ipa" Payload
+            rm -rf Payload
+            echo "Created unsigned IPA: build/$BUILD_ID.ipa"
+
+            echo "Verifying UnityFramework inside IPA:"
+            unzip -l "$BUILD_ID.ipa" | grep -i "UnityFramework" || echo "::warning::UnityFramework not found in IPA archive"
+          fi
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ipa
+          path: build/*.ipa
+          retention-days: 7
+          if-no-files-found: error
+
+      # Flutter builds through its own tree, so DerivedData can be absent and a
+      # save would fail on a path that never existed.
+      - name: Check for DerivedData
+        id: dd
+        if: always()
+        run: |
+          if [ -d DerivedData ]; then echo "exists=yes" >> $GITHUB_OUTPUT; fi
+
+      - name: Save DerivedData cache
+        uses: actions/cache/save@v6
+        if: always() && steps.dd.outputs.exists == 'yes'
+        with:
+          path: DerivedData
+          key: deriveddata-${{ github.run_id }}
+
+      - name: Cleanup signing
+        if: always() && inputs.use_signing
+        run: |
+          if [ -n "$KEYCHAIN_PATH" ] && [ -f "$KEYCHAIN_PATH" ]; then
+            security delete-keychain "$KEYCHAIN_PATH" || true
+          fi
+
+      - name: Build summary
+        if: always()
+        env:
+          USE_SIGNING: ${{ inputs.use_signing }}
+          CONFIGURATION: ${{ inputs.configuration }}
+        run: |
+          echo "## Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Build ID:** ${{ inputs.build_id }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status:** ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Configuration:** $CONFIGURATION" >> $GITHUB_STEP_SUMMARY
+          echo "- **DerivedData Cache:** ${{ steps.cache-deriveddata.outputs.cache-hit == 'true' && 'Hit' || 'Miss' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Pods Cache:** ${{ steps.pods-cache.outputs.cache-hit == 'true' && 'Hit' || 'Miss' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Node Modules Cache:** ${{ steps.node-modules-cache.outputs.cache-hit == 'true' && 'Hit' || 'N/A' }}" >> $GITHUB_STEP_SUMMARY
+          if [ "$USE_SIGNING" = "true" ]; then
+            echo "- **Signing:** Signed (development)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- **Signing:** Unsigned (sign locally with AltStore/Sideloadly)" >> $GITHUB_STEP_SUMMARY
+          fi
+          if [ -f build/*.ipa ]; then
+            IPA_PATH=$(find build -name "*.ipa" -type f | head -1)
+            echo "- **IPA Size:** $(ls -lh "$IPA_PATH" | awk '{print $5}')" >> $GITHUB_STEP_SUMMARY
+          fi

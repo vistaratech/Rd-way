@@ -1,0 +1,185 @@
+[
+  {
+    "id": "ev-station-1795169848950",
+    "name": "udumalaipettai station",
+    "address": "Placed Station at 10.5814, 77.2589",
+    "lat": 10.581444,
+    "lng": 77.258858,
+    "totalChargers": 6,
+    "availableChargers": 5,
+    "voltage": "480V DC Fast Charge (120 kW)",
+    "voltageValue": 480,
+    "powerKw": 120,
+    "twoWheeler": false,
+    "fourWheeler": true,
+    "vehicleTypes": [
+      "4W"
+    ],
+    "connectorTypes": [
+      "CCS2",
+      "Type 2 AC",
+      "15A Socket"
+    ],
+    "pricing": "₹16.00 / kWh",
+    "status": "Available",
+    "operatingHours": "24/7 Open",
+    "amenities": [
+      "Cafeteria",
+      "Restroom",
+      "Wi-Fi"
+    ],
+    "directions": {
+      "lat": 10.581444,
+      "lng": 77.258858,
+      "googleMapsUrl": "https://www.google.com/maps/dir/?api=1&destination=10.581444,77.258858"
+    },
+    "createdAt": "2026-11-20T10:17:28.950Z"
+  },
+  {
+    "id": "ev-station-1",
+    "name": "Rodeway SuperCharge Hub - Indiranagar",
+    "address": "100 Feet Rd, Defense Colony, Indiranagar, Bengaluru, Karnataka 560038",
+    "lat": 12.971598,
+    "lng": 77.6412,
+    "totalChargers": 8,
+    "availableChargers": 6,
+    "voltage": "480V DC Fast Charge (120 kW)",
+    "voltageValue": 480,
+    "powerKw": 120,
+    "twoWheeler": true,
+    "fourWheeler": true,
+    "vehicleTypes": [
+      "2W",
+      "4W"
+    ],
+    "connectorTypes": [
+      "CCS2",
+      "Type 2 AC",
+      "GB/T",
+      "15A 3-Pin Socket"
+    ],
+    "pricing": "₹16.50 / kWh",
+    "status": "Available",
+    "operatingHours": "24/7 Open",
+    "amenities": [
+      "Cafeteria",
+      "Restroom",
+      "Wi-Fi",
+      "Lounge",
+      "CCTV 24/7"
+    ],
+    "directions": {
+      "lat": 12.971598,
+      "lng": 77.6412,
+      "googleMapsUrl": "https://www.google.com/maps/dir/?api=1&destination=12.971598,77.641200"
+    },
+    "createdAt": "2026-11-20T10:00:00Z"
+  },
+  {
+    "id": "ev-station-2",
+    "name": "VoltPulse HyperDrive - Koramangala",
+    "address": "80 Feet Rd, 4th Block, Koramangala, Bengaluru, Karnataka 560034",
+    "lat": 12.935193,
+    "lng": 77.624481,
+    "totalChargers": 6,
+    "availableChargers": 4,
+    "voltage": "800V Ultra-Fast DC (240 kW)",
+    "voltageValue": 800,
+    "powerKw": 240,
+    "twoWheeler": false,
+    "fourWheeler": true,
+    "vehicleTypes": [
+      "4W"
+    ],
+    "connectorTypes": [
+      "CCS2",
+      "CHAdeMO"
+    ],
+    "pricing": "₹19.00 / kWh",
+    "status": "Available",
+    "operatingHours": "24/7 Open",
+    "amenities": [
+      "Coffee Shop",
+      "Restroom",
+      "Convenience Store"
+    ],
+    "directions": {
+      "lat": 12.935193,
+      "lng": 77.624481,
+      "googleMapsUrl": "https://www.google.com/maps/dir/?api=1&destination=12.935193,77.624481"
+    },
+    "createdAt": "2026-11-20T10:30:00Z"
+  },
+  {
+    "id": "ev-station-3",
+    "name": "EcoCharge 2W/4W Point - MG Road Metro",
+    "address": "Mahatma Gandhi Rd, Ashok Nagar, Bengaluru, Karnataka 560001",
+    "lat": 12.97563,
+    "lng": 77.606628,
+    "totalChargers": 10,
+    "availableChargers": 7,
+    "voltage": "240V / 400V Dual AC/DC (50 kW)",
+    "voltageValue": 400,
+    "powerKw": 50,
+    "twoWheeler": true,
+    "fourWheeler": true,
+    "vehicleTypes": [
+      "2W",
+      "4W"
+    ],
+    "connectorTypes": [
+      "Type 2 AC",
+      "CCS2",
+      "15A Socket",
+      "Ather Grid Dot"
+    ],
+    "pricing": "₹14.00 / kWh",
+    "status": "Available",
+    "operatingHours": "06:00 AM - 11:30 PM",
+    "amenities": [
+      "Metro Station",
+      "ATM",
+      "Food Court"
+    ],
+    "directions": {
+      "lat": 12.97563,
+      "lng": 77.606628,
+      "googleMapsUrl": "https://www.google.com/maps/dir/?api=1&destination=12.975630,77.606628"
+    },
+    "createdAt": "2026-11-20T11:00:00Z"
+  },
+  {
+    "id": "ev-station-4",
+    "name": "AeroVolt Two-Wheeler Express - HSR Layout",
+    "address": "27th Main Rd, Sector 1, HSR Layout, Bengaluru, Karnataka 560102",
+    "lat": 12.911622,
+    "lng": 77.653457,
+    "totalChargers": 4,
+    "availableChargers": 2,
+    "voltage": "240V AC High-Efficiency (7.4 kW)",
+    "voltageValue": 240,
+    "powerKw": 7.4,
+    "twoWheeler": true,
+    "fourWheeler": false,
+    "vehicleTypes": [
+      "2W"
+    ],
+    "connectorTypes": [
+      "15A 3-Pin Socket",
+      "Type 2 AC"
+    ],
+    "pricing": "₹12.00 / kWh",
+    "status": "Available",
+    "operatingHours": "24/7 Open",
+    "amenities": [
+      "EV Service Bay",
+      "Tire Pressure Station"
+    ],
+    "directions": {
+      "lat": 12.911622,
+      "lng": 77.653457,
+      "googleMapsUrl": "https://www.google.com/maps/dir/?api=1&destination=12.911622,77.653457"
+    },
+    "createdAt": "2026-11-20T11:15:00Z"
+  }
+]
